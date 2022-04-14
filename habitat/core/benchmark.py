@@ -12,24 +12,28 @@ and is implemented through metrics defined for ``habitat.EmbodiedTask``.
 import os
 from collections import defaultdict
 from typing import Dict, Optional
+import numpy as np
 
 from habitat.config.default import get_config
 from habitat.core.agent import Agent
 from habitat.core.env import Env
+from tqdm import tqdm
+import json
+import os
 
 
 class Benchmark:
     r"""Benchmark for evaluating agents in environments."""
 
     def __init__(
-        self, config_paths: Optional[str] = None, eval_remote: bool = False
+        self, config_paths: Optional[str] = None, eval_remote: bool = False, overriden_args: list = None,
     ) -> None:
         r"""..
 
         :param config_paths: file to be used for creating the environment
         :param eval_remote: boolean indicating whether evaluation should be run remotely or locally
         """
-        config_env = get_config(config_paths)
+        config_env = get_config(config_paths, overriden_args)
         self._eval_remote = eval_remote
 
         if self._eval_remote is True:
@@ -77,7 +81,7 @@ class Benchmark:
 
         count_episodes = 0
 
-        while count_episodes < num_episodes:
+        for _ in tqdm(range(num_episodes)):
             agent.reset()
             res_env = unpack_for_grpc(
                 stub.reset(evaluation_pb2.Package()).SerializedEntity
@@ -131,13 +135,28 @@ class Benchmark:
         agg_metrics: Dict = defaultdict(float)
 
         count_episodes = 0
-        while count_episodes < num_episodes:
+        if agent.args.do_error_analysis:
+            with open(agent.args.do_error_analysis, "a") as wf:
+                wf.write("\n====\n")
+        pbar = tqdm(range(num_episodes), desc="")
+        for _ in pbar:
             observations = self._env.reset()
             agent.reset()
 
             while not self._env.episode_over:
+                if agent.args.do_error_analysis:
+                    # Add these fields for error analysis
+                    observations['origin'] = np.array(self._env.current_episode.start_position)
+                    observations['rotation_world_start'] = np.array(self._env.current_episode.start_rotation)
+                    observations['gt_goal_positions'] = [np.array(g.position) for g in self._env.current_episode.goals]
+                    observations['success_distance'] = self._env.task.measurements.measures['success']._config.SUCCESS_DISTANCE
+                    observations['self_position'] = self._env.task._sim.get_agent_state().position
+                    observations['distance_to_goal'] = self._env.task.measurements.measures['distance_to_goal'].get_metric()
                 action = agent.act(observations)
                 observations = self._env.step(action)
+                # if self._env.task.measurements.measures['distance_to_goal']._metric:
+                # false negative (but what if taret object not yet in sight????)
+                # self._env.task._sim.get_agent_state().position
 
             metrics = self._env.get_metrics()
             for m, v in metrics.items():
@@ -146,9 +165,28 @@ class Benchmark:
                         agg_metrics[m + "/" + str(sub_m)] += sub_v
                 else:
                     agg_metrics[m] += v
+            if agent.args.do_error_analysis:
+                if metrics['success']:
+                    # write to file
+                    with open(agent.args.do_error_analysis, "a") as wf:
+                        wf.write(json.dumps({'envid': self._env.current_episode.episode_id, 'success': True, 'distance': metrics['distance_to_goal'], 'saw_target_frames': action['saw_target'], 'nearby_objs': action['other_objs'], 'target': action['objectgoal']})+"\n")
+                else:
+                    # failure mode...
+                    with open(agent.args.do_error_analysis, "a") as wf:
+                        wf.write(json.dumps({'envid': self._env.current_episode.episode_id, 'success': False, 'distance': metrics['distance_to_goal'], 'failures': action['failure_modes'], 'saw_target_frames': action['saw_target'], 'nearby_objs': action['other_objs'], 'target': action['objectgoal']})+"\n")
             count_episodes += 1
+            pbar.set_description(' '.join([
+                f'{m}={agg_metrics[m] / count_episodes:.2f}'
+                if not isinstance(agg_metrics[m], dict)
+                else f'{m}={json.dumps({sub_m: agg_metrics[m][sub_m] / count_episodes for sub_m in agg_metrics[m]})}'
+                for m in agg_metrics
+            ]))
 
         avg_metrics = {k: v / count_episodes for k, v in agg_metrics.items()}
+        if agent.args.do_error_analysis:
+            # log metrics
+            with open(agent.args.do_error_analysis, "a") as wf:
+                wf.write("Metrics: "+json.dumps(avg_metrics)+"\n")
 
         return avg_metrics
 
